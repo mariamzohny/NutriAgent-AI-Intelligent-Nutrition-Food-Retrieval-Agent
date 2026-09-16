@@ -1,8 +1,29 @@
 import json
 import re
-import ollama
+from datetime import datetime
 from typing import List, Optional, Literal, Tuple
 from pydantic import BaseModel, Field
+import ollama
+
+
+# ==========================================
+# 0. Global Configuration
+# ==========================================
+
+DEFAULT_MODEL: str = "qwen2.5:3b"
+
+# Intents supported across the project
+INTENT_TYPES = Literal[
+    "calculate_calories",          # Log meal or calculate meal calories
+    "calculate_macros",            # Specific macro breakdown request
+    "food_nutrition",              # Nutrition query about a single food/portion
+    "meal_recommendation",         # Single meal idea/recipe (e.g. "400 cal breakfast")
+    "daily_plan",                  # Full day/multi-day diet plan
+    "food_substitution",           # What can I substitute for X?
+    "fitness_nutrition_question",  # Workout/sports nutrition advice (FAISS RAG trigger)
+    "update_profile",              # Profile metrics & onboarding
+    "general_chat"                 # Greetings / chit-chat
+]
 
 
 # ==========================================
@@ -23,23 +44,35 @@ class UserProfileExtract(BaseModel):
     height:               Optional[float]                                                                  = Field(..., description="Height in cm or null")
     activity_level:       Optional[Literal["sedentary", "light", "moderate", "active", "very_active"]]    = Field(..., description="Activity level or null")
     goal:                 Optional[Literal["weight_loss", "maintenance", "weight_gain", "muscle_gain"]]   = Field(..., description="User goal or null")
-    dietary_restrictions: List[str]                                                                        = Field(..., description="e.g. ['keto', 'vegan'] or []")
-    forbidden_foods:      List[str]                                                                        = Field(..., description="Foods user avoids e.g. ['eggs'] or []")
-    preferred_foods:      List[str]                                                                        = Field(..., description="Foods user prefers or []")
-    allergies:            List[str]                                                                        = Field(..., description="Medical allergies e.g. ['dairy'] or []")
+    dietary_restrictions: List[str]                                                                        = Field(default=[], description="e.g. ['keto', 'vegan'] or []")
+    forbidden_foods:      List[str]                                                                        = Field(default=[], description="Foods user avoids e.g. ['eggs'] or []")
+    preferred_foods:      List[str]                                                                        = Field(default=[], description="Foods user prefers or []")
+    allergies:            List[str]                                                                        = Field(default=[], description="Medical allergies e.g. ['dairy'] or []")
 
 
 class NLPOutput(BaseModel):
-    intent: Literal["log_meal", "create_meal_plan", "ask_nutrition", "update_profile", "general_chat"] = Field(
-        ..., description="User intent"
+    intent: INTENT_TYPES = Field(
+        ..., description="User intent according to project specifications"
     )
     language_detected: Literal["arabic", "english", "mixed"] = Field(
         ..., description="Detected input language"
     )
     raw_text: str = Field(..., description="Original user input, echoed verbatim")
-    foods: List[FoodItem] = Field(..., description="Extracted food items ([] for update_profile / general_chat)")
+    foods: List[FoodItem] = Field(..., description="Extracted food items ([] if none)")
+    
+    # Specific fields for meal planning and recommendation requests (Critical Gap 1 & 2)
+    meal_type: Optional[Literal["breakfast", "lunch", "dinner", "snack", "all_day"]] = Field(
+        ..., description="Specific meal requested: breakfast, lunch, dinner, snack, all_day, or null"
+    )
+    target_calories: Optional[float] = Field(
+        ..., description="Explicit target calories requested (e.g. 400.0 for '400-calorie breakfast') or null"
+    )
+    requested_substitution: Optional[str] = Field(
+        ..., description="Food to be substituted when intent is food_substitution (e.g. 'eggs', 'cheese') or null"
+    )
+
     profile_data: Optional[UserProfileExtract] = Field(
-        default=None,
+        ...,
         description="Full profile object when intent is update_profile, otherwise null"
     )
 
@@ -74,7 +107,7 @@ def detect_language(text: str) -> Literal["arabic", "english", "mixed"]:
 
 
 # ==========================================
-# 3. Unit Normalization
+# 3. Normalization & Sanity Checks
 # ==========================================
 
 UNIT_ALIASES: dict = {
@@ -126,7 +159,6 @@ def _extract_gender_from_text(text: str) -> Optional[str]:
     Deterministic gender extraction from well-known Arabic/English keywords.
     Checks female keywords first to avoid 'female' containing 'male' substring.
     """
-    # Clean and pad text with spaces for whole-word matching
     cleaned = re.sub(r'[^a-zA-Z\u0600-\u06FF\s]', ' ', text.lower())
     padded = f" {cleaned} "
     
@@ -139,70 +171,171 @@ def _extract_gender_from_text(text: str) -> Optional[str]:
     return None
 
 
+def sanitize_extracted_values(parsed: dict) -> dict:
+    """
+    Sanity checks for extracted biometric & metric numbers (Critical Gap 7):
+    - Height: Fix mm (1750 -> 175) or clamp between 50cm and 260cm.
+    - Weight: Clamp/validate between 20kg and 350kg.
+    - Target calories: Clamp between 50 and 10000 kcal.
+    """
+    profile = parsed.get("profile_data")
+    if profile:
+        # Height sanity
+        if profile.get("height") is not None:
+            try:
+                h = float(profile["height"])
+                if h >= 500:   # e.g. 1750 mm -> 175.0 cm
+                    h = h / 10.0
+                if 50.0 <= h <= 260.0:
+                    profile["height"] = round(h, 1)
+                else:
+                    profile["height"] = None
+            except (ValueError, TypeError):
+                profile["height"] = None
+
+        # Weight sanity
+        if profile.get("weight") is not None:
+            try:
+                w = float(profile["weight"])
+                if 20.0 <= w <= 350.0:
+                    profile["weight"] = round(w, 1)
+                else:
+                    profile["weight"] = None
+            except (ValueError, TypeError):
+                profile["weight"] = None
+
+    # Target calories sanity
+    if parsed.get("target_calories") is not None:
+        try:
+            tc = float(parsed["target_calories"])
+            if 50.0 <= tc <= 15000.0:
+                parsed["target_calories"] = round(tc, 1)
+            else:
+                parsed["target_calories"] = None
+        except (ValueError, TypeError):
+            parsed["target_calories"] = None
+
+    return parsed
+
+
+NON_FOOD_STOP_WORDS = {
+    "before workout", "after workout", "without eggs", "breakfast meal", "lunch meal",
+    "dinner meal", "snack", "item", "meal", "substitute", "food", "diet",
+    "وجبة فطور", "وجبة غداء", "وجبة عشاء", "بدون بيض", "قبل التمرين", "بعد التمرين"
+}
+
+EMPTY_FOODS_INTENTS = {
+    "meal_recommendation",
+    "fitness_nutrition_question",
+    "daily_plan",
+    "food_substitution",
+    "update_profile",
+    "general_chat"
+}
+
+
 def normalize_output(parsed: dict) -> dict:
     """
     Post-process LLM output:
     - Normalize unit strings to canonical form.
     - Clamp non-positive quantities to 1.0.
     - Lowercase food_name_en for USDA search compatibility.
-    - Remove duplicate food entries.
-    - Deterministic gender fallback: if profile_data.gender is null,
-      try to extract it from the raw text via keyword matching.
+    - Remove duplicate food entries and non-food descriptor artifacts.
+    - Ensure foods is empty for recommendation/question/profile intents.
+    - Ensure food_name_original matches the language of raw_text.
+    - Deterministic gender fallback if profile_data.gender is null.
+    - Run sanity checks on biometric values.
     """
-    # ── Food normalization ────────────────────────────────────────────────────
-    seen: set = set()
-    clean_foods: list = []
-    for food in parsed.get("foods", []):
-        raw_unit = str(food.get("unit", "")).strip().lower()
-        food["unit"] = UNIT_ALIASES.get(raw_unit, raw_unit)
-        if food.get("quantity", 0) <= 0:
-            food["quantity"] = 1.0
-        food["food_name_en"] = food.get("food_name_en", "").strip().lower()
-        key = (food["food_name_en"], food["quantity"], food["unit"])
-        if key not in seen:
-            seen.add(key)
-            clean_foods.append(food)
-    parsed["foods"] = clean_foods
+    intent = parsed.get("intent")
+    raw_text = parsed.get("raw_text", "")
+    lang = detect_language(raw_text)
+
+    # ── If intent does NOT log an eaten meal, foods MUST be [] ───────────────
+    if intent in EMPTY_FOODS_INTENTS:
+        parsed["foods"] = []
+    else:
+        # ── Food normalization & artifact removal ─────────────────────────────
+        seen: set = set()
+        clean_foods: list = []
+        for food in parsed.get("foods", []):
+            name_en = food.get("food_name_en", "").strip().lower()
+            name_orig = food.get("food_name_original", "").strip()
+
+            # Filter out non-food stopwords
+            if name_en in NON_FOOD_STOP_WORDS or name_orig.lower() in NON_FOOD_STOP_WORDS:
+                continue
+
+            # Fix food_name_original: on English inputs, never keep an Arabic translation hallucination
+            if lang == "english" and re.search(r'[\u0600-\u06FF]', name_orig):
+                name_orig = name_en
+            food["food_name_original"] = name_orig
+
+            raw_unit = str(food.get("unit", "")).strip().lower()
+            food["unit"] = UNIT_ALIASES.get(raw_unit, raw_unit)
+            if food.get("quantity", 0) <= 0:
+                food["quantity"] = 1.0
+            food["food_name_en"] = name_en
+            
+            key = (food["food_name_en"], food["quantity"], food["unit"])
+            if key not in seen and name_en:
+                seen.add(key)
+                clean_foods.append(food)
+        parsed["foods"] = clean_foods
 
     # ── Deterministic gender fallback ─────────────────────────────────────────
     profile = parsed.get("profile_data")
     if profile and profile.get("gender") is None:
-        raw = parsed.get("raw_text", "")
-        detected_gender = _extract_gender_from_text(raw)
+        detected_gender = _extract_gender_from_text(raw_text)
         if detected_gender:
             profile["gender"] = detected_gender
 
-    return parsed
+    # ── Sanity checks ─────────────────────────────────────────────────────────
+    return sanitize_extracted_values(parsed)
 
 
 # ==========================================
-# 4. System Prompt & Few-Shot Examples
+# 4. System Prompt & Dynamic Date Injection
 # ==========================================
 
-SYSTEM_PROMPT = """
-You are a precise multilingual NLP parser for a fitness calorie-tracking assistant.
-You understand Arabic, English, and Arabic-English mixed (code-switched) text.
+def get_system_prompt() -> str:
+    """
+    Build system prompt dynamically injecting current date & year (Critical Gap 4).
+    """
+    current_date = datetime.now().strftime("%Y-%m-%d")
+    current_year = datetime.now().year
+    
+    return f"""You are a precise multilingual NLP parser for a fitness calorie-tracking and nutrition assistant.
+You understand Arabic (including Egyptian slang), English, and Arabic-English mixed (code-switched) text.
 
-INTENT DEFINITIONS:
-- log_meal         → user is recording food they ate or will eat
-- create_meal_plan → user wants a full day/week meal plan suggestion
-- ask_nutrition     → user is asking about calories/macros of a specific food
-- update_profile   → user is providing personal info (age, weight, height, goal, restrictions, etc.)
-- general_chat     → greetings, off-topic, unclear intent
+CURRENT RUNTIME DATE: {current_date} (Current Year: {current_year})
+
+INTENT TAXONOMY (Strictly map to one of these):
+1. calculate_calories         → user is logging/recording food they ate or will eat (e.g. "كلت 200g فراخ", "I had 2 eggs and toast")
+2. calculate_macros           → user specifically asks for macro breakdown (protein/carbs/fats) of their meal
+3. food_nutrition             → user asks for calories/macros of a specific item (e.g. "How many calories in 100g avocado?", "كم سعرة في الموز؟")
+4. meal_recommendation        → user asks for a single meal suggestion with specific constraints/calories (e.g. "Make me a 400-calorie breakfast without eggs", "عايز فطار 400 سعرة بدون بيض")
+5. daily_plan                 → user asks for a full day or multi-day meal plan (e.g. "خطة أكل ليوم كامل", "give me a full day meal plan")
+6. food_substitution          → user asks what to substitute for a specific food (e.g. "what can I substitute for cheese?", "بديل البيض في الدايت")
+7. fitness_nutrition_question → user asks fitness/exercise nutrition advice (e.g. "what should I eat before workout?", "أكل إيه قبل التمرين؟", "best post workout protein")
+8. update_profile             → user provides personal metrics (age, date of birth, weight, height, goal, allergies, activity level)
+9. general_chat               → greetings, thank you, off-topic, chit-chat
 
 OUTPUT RULES:
-1. Always return valid JSON matching the schema exactly.
+1. Always return valid JSON matching the schema.
 2. raw_text: copy the user's exact input.
 3. language_detected: set to "arabic", "english", or "mixed".
-4. foods: list of food items. MUST be [] when intent is update_profile or general_chat.
-5. profile_data: full object when intent is update_profile, otherwise MUST be null.
+4. meal_type: set to "breakfast", "lunch", "dinner", "snack", "all_day", or null.
+5. target_calories: extract numeric calories if user specified a calorie budget (e.g. 400.0 for "400-calorie breakfast").
+6. requested_substitution: extract the food name being substituted if intent is food_substitution (e.g. "eggs" or "cheese").
+7. foods: list of food items. MUST be [] when intent is update_profile, fitness_nutrition_question, or general_chat.
+8. profile_data: full object when intent is update_profile, otherwise MUST be null.
 
 RULES FOR profile_data (when intent = update_profile):
 Fill EVERY field — do NOT omit any key:
-- birth_date:           "YYYY-MM-DD" or null
+- birth_date:           "YYYY-MM-DD" (if user gives age e.g. 22 years, calculate as "{current_year - 22}-01-01") or null
 - gender:               "male" | "female" | null
-- weight:               number in kg | null
-- height:               number in cm | null
+- weight:               number in kg (e.g. 80.0) | null
+- height:               number in cm (e.g. 175.0) | null
 - activity_level:       "sedentary" | "light" | "moderate" | "active" | "very_active" | null
 - goal:                 "weight_loss" | "maintenance" | "weight_gain" | "muscle_gain" | null
 - dietary_restrictions: [] or list (e.g. ["keto", "vegan"])
@@ -216,18 +349,58 @@ ACTIVITY LEVEL MAPPING:
 - Moderate exercise 3-5 days/week / تمرين متوسط         → moderate
 - Hard exercise 6-7 days/week / جيم كل يوم / تدريب عنيف → active
 - Very intense / twice daily / مرتين في اليوم           → very_active
-
-AGE HINT: If user gives age instead of birth_date, estimate birth_date by subtracting from current year.
 """
 
-# fmt: off
+
+# ==========================================
+# 4.1 Few-Shot Examples
+# ==========================================
+
 FEW_SHOT_EXAMPLES: List[dict] = [
 
-    # ── 1. Arabic full profile ─────────────────────────────────────────────────
+    # ── 1. Meal Recommendation with Target Calories & Meal Type (Critical Gap 1)
+    {"role": "user", "content": "Make me a 400-calorie breakfast without eggs"},
+    {"role": "assistant", "content": json.dumps({
+        "intent": "meal_recommendation", "language_detected": "english",
+        "raw_text": "Make me a 400-calorie breakfast without eggs",
+        "meal_type": "breakfast", "target_calories": 400.0, "requested_substitution": None,
+        "foods": [], "profile_data": None
+    }, ensure_ascii=False)},
+
+    # ── 2. Arabic Meal Recommendation with Target Calories
+    {"role": "user", "content": "عايز وجبة غداء في حدود 600 سعرة بدون سمك"},
+    {"role": "assistant", "content": json.dumps({
+        "intent": "meal_recommendation", "language_detected": "arabic",
+        "raw_text": "عايز وجبة غداء في حدود 600 سعرة بدون سمك",
+        "meal_type": "lunch", "target_calories": 600.0, "requested_substitution": None,
+        "foods": [], "profile_data": None
+    }, ensure_ascii=False)},
+
+    # ── 3. Food Substitution (Critical Gap 2)
+    {"role": "user", "content": "What can I substitute for cheese in my diet?"},
+    {"role": "assistant", "content": json.dumps({
+        "intent": "food_substitution", "language_detected": "english",
+        "raw_text": "What can I substitute for cheese in my diet?",
+        "meal_type": None, "target_calories": None, "requested_substitution": "cheese",
+        "foods": [{"food_name_original": "cheese", "food_name_en": "cheese", "quantity": 1.0, "unit": "piece"}],
+        "profile_data": None
+    }, ensure_ascii=False)},
+
+    # ── 4. Fitness Nutrition Question (FAISS RAG Trigger)
+    {"role": "user", "content": "أكل إيه قبل التمرين عشان يديني طاقة؟"},
+    {"role": "assistant", "content": json.dumps({
+        "intent": "fitness_nutrition_question", "language_detected": "arabic",
+        "raw_text": "أكل إيه قبل التمرين عشان يديني طاقة؟",
+        "meal_type": "snack", "target_calories": None, "requested_substitution": None,
+        "foods": [], "profile_data": None
+    }, ensure_ascii=False)},
+
+    # ── 5. Full Profile Onboarding (Arabic)
     {"role": "user", "content": "أنا ولد اتولدت 2004-05-10، وزني 90 وطولي 175، بتمرن 4 أيام في الأسبوع وعايز أخس، بس مش باكل بيض وعندي حساسية ألبان"},
     {"role": "assistant", "content": json.dumps({
         "intent": "update_profile", "language_detected": "arabic",
         "raw_text": "أنا ولد اتولدت 2004-05-10، وزني 90 وطولي 175، بتمرن 4 أيام في الأسبوع وعايز أخس، بس مش باكل بيض وعندي حساسية ألبان",
+        "meal_type": None, "target_calories": None, "requested_substitution": None,
         "foods": [],
         "profile_data": {
             "birth_date": "2004-05-10", "gender": "male",
@@ -238,41 +411,12 @@ FEW_SHOT_EXAMPLES: List[dict] = [
         }
     }, ensure_ascii=False)},
 
-    # ── 2. English full profile ────────────────────────────────────────────────
-    {"role": "user", "content": "I'm a female born on 1999-03-15, weight 65kg height 160cm, gym 3 times a week, goal is weight loss, I'm vegan and allergic to peanuts"},
-    {"role": "assistant", "content": json.dumps({
-        "intent": "update_profile", "language_detected": "english",
-        "raw_text": "I'm a female born on 1999-03-15, weight 65kg height 160cm, gym 3 times a week, goal is weight loss, I'm vegan and allergic to peanuts",
-        "foods": [],
-        "profile_data": {
-            "birth_date": "1999-03-15", "gender": "female",
-            "weight": 65.0, "height": 160.0,
-            "activity_level": "moderate", "goal": "weight_loss",
-            "dietary_restrictions": ["vegan"], "forbidden_foods": [],
-            "preferred_foods": [], "allergies": ["peanuts"]
-        }
-    }, ensure_ascii=False)},
-
-    # ── 3. Code-switched profile ───────────────────────────────────────────────
-    {"role": "user", "content": "أنا female اتولدت 2001-08-20 وزني 55 kg وطولي 162 cm، بعمل light exercise وعايزة muscle gain"},
-    {"role": "assistant", "content": json.dumps({
-        "intent": "update_profile", "language_detected": "mixed",
-        "raw_text": "أنا female اتولدت 2001-08-20 وزني 55 kg وطولي 162 cm، بعمل light exercise وعايزة muscle gain",
-        "foods": [],
-        "profile_data": {
-            "birth_date": "2001-08-20", "gender": "female",
-            "weight": 55.0, "height": 162.0,
-            "activity_level": "light", "goal": "muscle_gain",
-            "dietary_restrictions": [], "forbidden_foods": [],
-            "preferred_foods": [], "allergies": []
-        }
-    }, ensure_ascii=False)},
-
-    # ── 4. Arabic meal log ─────────────────────────────────────────────────────
+    # ── 6. Log Meal / Calculate Calories (Arabic)
     {"role": "user", "content": "كلت 200g فراخ مشوية مع طبق رز"},
     {"role": "assistant", "content": json.dumps({
-        "intent": "log_meal", "language_detected": "arabic",
+        "intent": "calculate_calories", "language_detected": "arabic",
         "raw_text": "كلت 200g فراخ مشوية مع طبق رز",
+        "meal_type": "lunch", "target_calories": None, "requested_substitution": None,
         "foods": [
             {"food_name_original": "فراخ مشوية", "food_name_en": "grilled chicken breast", "quantity": 200.0, "unit": "gram"},
             {"food_name_original": "رز",          "food_name_en": "cooked white rice",       "quantity": 1.0,   "unit": "bowl"}
@@ -280,74 +424,51 @@ FEW_SHOT_EXAMPLES: List[dict] = [
         "profile_data": None
     }, ensure_ascii=False)},
 
-    # ── 5. English meal log ────────────────────────────────────────────────────
-    {"role": "user", "content": "I had 2 boiled eggs and a cup of oats with milk for breakfast"},
+    # ── 7. Food Nutrition Query (Single item)
+    {"role": "user", "content": "How many calories are in 200g chicken breast?"},
     {"role": "assistant", "content": json.dumps({
-        "intent": "log_meal", "language_detected": "english",
-        "raw_text": "I had 2 boiled eggs and a cup of oats with milk for breakfast",
-        "foods": [
-            {"food_name_original": "boiled eggs", "food_name_en": "boiled egg",  "quantity": 2.0, "unit": "piece"},
-            {"food_name_original": "oats",         "food_name_en": "rolled oats", "quantity": 1.0, "unit": "cup"},
-            {"food_name_original": "milk",          "food_name_en": "whole milk",  "quantity": 1.0, "unit": "cup"}
-        ],
+        "intent": "food_nutrition", "language_detected": "english",
+        "raw_text": "How many calories are in 200g chicken breast?",
+        "meal_type": None, "target_calories": None, "requested_substitution": None,
+        "foods": [{"food_name_original": "chicken breast", "food_name_en": "chicken breast", "quantity": 200.0, "unit": "gram"}],
         "profile_data": None
     }, ensure_ascii=False)},
 
-    # ── 6. Code-switched meal log ──────────────────────────────────────────────
-    {"role": "user", "content": "أكلت grilled salmon مع 1 cup برية وسلطة"},
-    {"role": "assistant", "content": json.dumps({
-        "intent": "log_meal", "language_detected": "mixed",
-        "raw_text": "أكلت grilled salmon مع 1 cup برية وسلطة",
-        "foods": [
-            {"food_name_original": "grilled salmon", "food_name_en": "grilled salmon", "quantity": 1.0, "unit": "piece"},
-            {"food_name_original": "برية",            "food_name_en": "brown rice",     "quantity": 1.0, "unit": "cup"},
-            {"food_name_original": "سلطة",            "food_name_en": "green salad",    "quantity": 1.0, "unit": "bowl"}
-        ],
-        "profile_data": None
-    }, ensure_ascii=False)},
-
-    # ── 7. Meal plan request ───────────────────────────────────────────────────
+    # ── 8. Daily Plan Request
     {"role": "user", "content": "ممكن تعملي خطة أكل ليوم كامل؟"},
     {"role": "assistant", "content": json.dumps({
-        "intent": "create_meal_plan", "language_detected": "arabic",
+        "intent": "daily_plan", "language_detected": "arabic",
         "raw_text": "ممكن تعملي خطة أكل ليوم كامل؟",
+        "meal_type": "all_day", "target_calories": None, "requested_substitution": None,
         "foods": [], "profile_data": None
     }, ensure_ascii=False)},
 
-    # ── 8. Nutrition question ──────────────────────────────────────────────────
-    {"role": "user", "content": "How many calories are in 100g of avocado?"},
-    {"role": "assistant", "content": json.dumps({
-        "intent": "ask_nutrition", "language_detected": "english",
-        "raw_text": "How many calories are in 100g of avocado?",
-        "foods": [{"food_name_original": "avocado", "food_name_en": "avocado", "quantity": 100.0, "unit": "gram"}],
-        "profile_data": None
-    }, ensure_ascii=False)},
-
-    # ── 9. General chat / greeting ─────────────────────────────────────────────
-    {"role": "user", "content": "أهلاً، إيه اللي تقدر تعمله؟"},
+    # ── 9. General Chat
+    {"role": "user", "content": "صباح الخير، إيه اللي تقدر تعمله؟"},
     {"role": "assistant", "content": json.dumps({
         "intent": "general_chat", "language_detected": "arabic",
-        "raw_text": "أهلاً، إيه اللي تقدر تعمله؟",
+        "raw_text": "صباح الخير، إيه اللي تقدر تعمله؟",
+        "meal_type": None, "target_calories": None, "requested_substitution": None,
         "foods": [], "profile_data": None
-    }, ensure_ascii=False)},
+    }, ensure_ascii=False)}
 ]
-# fmt: on
 
 
 # ==========================================
 # 5. Onboarding: Mandatory Fields & Prompts
 # ==========================================
 
-# The 6 fields Task 3 MUST have before calculating BMR / TDEE
 MANDATORY_FIELDS: List[str] = [
     "birth_date", "gender", "weight", "height", "activity_level", "goal"
 ]
 
-# Bilingual follow-up prompts for each missing field
+# Only intents that calculate personalized BMR/TDEE targets require full onboarding (Critical Gap 3)
+PROFILE_DEPENDENT_INTENTS = {"daily_plan", "update_profile"}
+
 _FIELD_PROMPTS: dict = {
     "birth_date": {
-        "ar": "📅 ما هو تاريخ ميلادك؟ (بصيغة YYYY-MM-DD مثلاً: 2000-03-15)",
-        "en": "📅 What is your date of birth? (format: YYYY-MM-DD, e.g. 2000-03-15)"
+        "ar": "📅 ما هو تاريخ ميلادك أو عمرك؟ (مثلاً: 2000-03-15 أو عندي 24 سنة)",
+        "en": "📅 What is your date of birth or age? (e.g. 2000-03-15 or 24 years old)"
     },
     "gender": {
         "ar": "⚧  ما هو جنسك؟ (ذكر = male / أنثى = female)",
@@ -399,21 +520,11 @@ _FIELD_PROMPTS: dict = {
 
 
 def get_onboarding_prompt(missing_fields: List[str], lang: str = "english") -> str:
-    """
-    Build a bilingual conversational prompt asking for missing mandatory fields.
-
-    Args:
-        missing_fields: list of field names that are still None.
-        lang: "arabic" | "english" | "mixed"  (from detect_language)
-
-    Returns:
-        A formatted string to show the user.
-    """
     key = "ar" if lang == "arabic" else "en"
     if lang == "arabic":
-        header = "مرحباً! 👋 قبل ما نبدأ، محتاج بعض المعلومات الأساسية عشان أحسب السعرات الحرارية بدقة:\n\n"
+        header = "مرحباً! 👋 عشان أقدر أحسب سعراتك وخطة أكلك بدقة، محتاج بعض المعلومات الأساسية:\n\n"
     else:
-        header = "👋 Welcome! Before we start, I need a few details to calculate your calories accurately:\n\n"
+        header = "👋 Welcome! To calculate your personalized calories and meal plan accurately, I need a few details:\n\n"
 
     lines = [_FIELD_PROMPTS[f][key] for f in missing_fields if f in _FIELD_PROMPTS]
     return header + "\n\n".join(lines)
@@ -424,12 +535,6 @@ def get_onboarding_prompt(missing_fields: List[str], lang: str = "english") -> s
 # ==========================================
 
 def validate_mandatory_profile_fields(profile: dict) -> Tuple[bool, List[str]]:
-    """
-    Check whether all 6 mandatory Task-3 fields are non-null.
-
-    Returns:
-        (is_complete: bool, missing_fields: List[str])
-    """
     if not profile:
         return False, MANDATORY_FIELDS[:]
     missing = [k for k in MANDATORY_FIELDS if profile.get(k) is None]
@@ -461,163 +566,152 @@ def merge_profile(existing: dict, new_data: dict, raw_text: Optional[str] = None
 
 
 # ==========================================
-# 7. Core Parser Functions
+# 7. Core Parser Functions (with Retry & Fallback)
 # ==========================================
 
-def parse_user_input(user_message: str) -> dict:
+def parse_user_input(user_message: str, model: str = DEFAULT_MODEL) -> dict:
     """
-    Parse a single user message into a structured NLPOutput dict.
-
-    - Uses Ollama (qwen2.5:3b) with structured JSON output.
-    - Overrides language_detected deterministically via detect_language().
-    - Runs normalize_output() post-processing.
-
-    Returns:
-        dict matching NLPOutput schema.
+    Parse a single user message into a structured NLPOutput dict with retry & error handling (Critical Gap 5 & 6).
     """
+    system_prompt = get_system_prompt()
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         *FEW_SHOT_EXAMPLES,
         {"role": "user", "content": user_message}
     ]
 
-    response = ollama.chat(
-        model="qwen2.5:3b",
-        messages=messages,
-        format=NLPOutput.model_json_schema(),
-        options={"temperature": 0.0}
-    )
+    # Retry logic (1 retry if JSON decode or connection fails)
+    for attempt in range(2):
+        try:
+            response = ollama.chat(
+                model=model,
+                messages=messages,
+                format=NLPOutput.model_json_schema(),
+                options={"temperature": 0.0}
+            )
+            parsed: dict = json.loads(response["message"]["content"])
+            
+            # Deterministic overrides
+            parsed["language_detected"] = detect_language(user_message)
+            parsed["raw_text"] = user_message
 
-    parsed: dict = json.loads(response["message"]["content"])
+            return normalize_output(parsed)
+        except Exception as e:
+            if attempt == 1:
+                # Safe fallback response (never crash)
+                fallback = {
+                    "intent": "general_chat",
+                    "language_detected": detect_language(user_message),
+                    "raw_text": user_message,
+                    "meal_type": None,
+                    "target_calories": None,
+                    "requested_substitution": None,
+                    "foods": [],
+                    "profile_data": None
+                }
+                return normalize_output(fallback)
 
-    # Deterministic overrides — never trust the LLM for these
-    parsed["language_detected"] = detect_language(user_message)
-    parsed["raw_text"] = user_message
 
-    return normalize_output(parsed)
-
-
-def parse_with_context(user_message: str, history: Optional[List[dict]] = None) -> dict:
+def parse_with_context(user_message: str, history: Optional[List[dict]] = None, model: str = DEFAULT_MODEL) -> dict:
     """
-    Parse with optional conversation history for reference/pronoun resolution.
-
-    Args:
-        user_message: The new user utterance.
-        history: List of {"role": "user"/"assistant", "content": str} dicts.
-                 Only the last 3 full exchanges (6 messages) are included.
-
-    Returns:
-        dict matching NLPOutput schema.
+    Parse with conversation history for pronoun and context resolution.
     """
     history_turns = (history or [])[-6:]
+    system_prompt = get_system_prompt()
 
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         *FEW_SHOT_EXAMPLES,
         *history_turns,
         {"role": "user", "content": user_message}
     ]
 
-    response = ollama.chat(
-        model="qwen2.5:3b",
-        messages=messages,
-        format=NLPOutput.model_json_schema(),
-        options={"temperature": 0.0}
-    )
+    for attempt in range(2):
+        try:
+            response = ollama.chat(
+                model=model,
+                messages=messages,
+                format=NLPOutput.model_json_schema(),
+                options={"temperature": 0.0}
+            )
+            parsed: dict = json.loads(response["message"]["content"])
+            parsed["language_detected"] = detect_language(user_message)
+            parsed["raw_text"] = user_message
 
-    parsed: dict = json.loads(response["message"]["content"])
-    parsed["language_detected"] = detect_language(user_message)
-    parsed["raw_text"] = user_message
-
-    return normalize_output(parsed)
+            return normalize_output(parsed)
+        except Exception as e:
+            if attempt == 1:
+                fallback = {
+                    "intent": "general_chat",
+                    "language_detected": detect_language(user_message),
+                    "raw_text": user_message,
+                    "meal_type": None,
+                    "target_calories": None,
+                    "requested_substitution": None,
+                    "foods": [],
+                    "profile_data": None
+                }
+                return normalize_output(fallback)
 
 
 # ==========================================
 # 7.1 Dedicated Split Functions for Teammates
 # ==========================================
 
-def get_food_data(user_message: str) -> dict:
+def get_food_data(user_message: str, model: str = DEFAULT_MODEL) -> dict:
     """
-    Extract the Meal/Food data along with message metadata (intent, language, raw_text).
-    Perfect for Task 2 (USDA API search), Task 3 (food nutrition calculation), and Task 4.
+    Extract the Meal/Food data along with message metadata (intent, language, raw_text, meal_type, target_calories).
+    Perfect for Task 2 (USDA API search), Task 3 (food nutrition calculation), and Task 4 (Agent).
 
     Example:
-        >>> get_food_data("كلت 200g فراخ مشوية مع طبق رز")
+        >>> get_food_data("Make me a 400-calorie breakfast without eggs")
         {
-            "intent": "log_meal",
-            "language_detected": "arabic",
-            "raw_text": "كلت 200g فراخ مشوية مع طبق رز",
-            "foods": [
-                {"food_name_original": "فراخ مشوية", "food_name_en": "grilled chicken breast", "quantity": 200.0, "unit": "gram"},
-                {"food_name_original": "طبق رز", "food_name_en": "cooked white rice", "quantity": 1.0, "unit": "bowl"}
-            ]
+            "intent": "meal_recommendation",
+            "language_detected": "english",
+            "raw_text": "Make me a 400-calorie breakfast without eggs",
+            "meal_type": "breakfast",
+            "target_calories": 400.0,
+            "requested_substitution": None,
+            "foods": []
         }
     """
-    parsed = parse_user_input(user_message)
+    parsed = parse_user_input(user_message, model=model)
     return {
-        "intent":            parsed.get("intent"),
-        "language_detected": parsed.get("language_detected"),
-        "raw_text":          parsed.get("raw_text", user_message),
-        "foods":             parsed.get("foods", [])
+        "intent":                 parsed.get("intent"),
+        "language_detected":      parsed.get("language_detected"),
+        "raw_text":               parsed.get("raw_text", user_message),
+        "meal_type":              parsed.get("meal_type"),
+        "target_calories":        parsed.get("target_calories"),
+        "requested_substitution": parsed.get("requested_substitution"),
+        "foods":                  parsed.get("foods", [])
     }
 
 
-def get_user_profile(user_message: str) -> Optional[dict]:
+def get_user_profile(user_message: str, model: str = DEFAULT_MODEL) -> Optional[dict]:
     """
     Extract ONLY the 10-field User Profile from user message.
     Perfect for Task 3 (BMR, TDEE, target calories engine).
-
-    Example:
-        >>> get_user_profile("أنا ولد اتولدت 2004-05-10، وزني 90 وطولي 175، بتمرن 4 أيام وعايز أخس، مش باكل بيض")
-        {
-            "birth_date": "2004-05-10",
-            "gender": "male",
-            "weight": 90.0,
-            "height": 175.0,
-            "activity_level": "moderate",
-            "goal": "weight_loss",
-            "dietary_restrictions": [],
-            "forbidden_foods": ["eggs"],
-            "preferred_foods": [],
-            "allergies": []
-        }
     """
-    parsed = parse_user_input(user_message)
+    parsed = parse_user_input(user_message, model=model)
     return parsed.get("profile_data")
 
 
 # ==========================================
-# 8. NLPSession — Onboarding + State Manager
+# 8. NLPSession — Selective Onboarding & State Manager
 # ==========================================
 
 class NLPSession:
     """
-    Stateful session manager for a single user conversation.
+    Stateful session manager for conversational interaction.
 
-    Enforces onboarding: the user MUST supply all 6 mandatory profile fields
-    (birth_date, gender, weight, height, activity_level, goal) before any
-    other intents (log_meal, create_meal_plan, etc.) are processed by Task 3/4.
-
-    Typical usage
-    -------------
-        session = NLPSession()
-
-        while True:
-            user_input = input("You: ")
-            result = session.process(user_input)
-
-            if result["status"] == "needs_profile":
-                print("Bot:", result["prompt_for_user"])   # ask for missing fields
-            elif result["status"] == "onboarding_complete":
-                print("Bot:", result["prompt_for_user"])   # confirmation message
-                # pass result["profile"] to Task 3 to calculate BMR/TDEE
-            else:  # "ready"
-                # pass result["parsed"] to Task 4 agent
-                ...
+    Selective Onboarding (Critical Gap 3):
+    - Simple queries (food_nutrition, fitness_nutrition_question, food_substitution, calculate_calories)
+      are NEVER blocked, enabling simplified usage.
+    - Profile-dependent intents (daily_plan, update_profile) check for the 6 mandatory fields.
     """
 
-    def __init__(self):
-        # Stored user profile — starts fully null / empty
+    def __init__(self, model: str = DEFAULT_MODEL):
+        self.model: str = model
         self.profile: dict = {
             "birth_date":           None,
             "gender":               None,
@@ -631,43 +725,33 @@ class NLPSession:
             "allergies":            []
         }
         self.onboarding_complete: bool = False
-        self.history: List[dict] = []        # raw conversation history
-        self.language: str = "english"       # updated on each turn
+        self.history: List[dict] = []
+        self.language: str = "english"
 
-    # ------------------------------------------------------------------
     def process(self, user_message: str) -> dict:
         """
         Process one user turn.
-
-        Returns a dict with keys:
-        ┌─────────────────┬──────────────────────────────────────────────────────┐
-        │ key             │ description                                          │
-        ├─────────────────┼──────────────────────────────────────────────────────┤
-        │ parsed          │ Full NLPOutput dict from the parser                  │
-        │ status          │ "needs_profile" | "onboarding_complete" | "ready"    │
-        │ prompt_for_user │ String to display to user (or None when ready)       │
-        │ profile         │ Current accumulated profile dict                     │
-        │ missing_fields  │ List of still-missing mandatory field names (or [])  │
-        └─────────────────┴──────────────────────────────────────────────────────┘
         """
         self.language = detect_language(user_message)
-
-        # Parse with conversation history for context awareness
-        parsed = parse_with_context(user_message, self.history)
+        parsed = parse_with_context(user_message, self.history, model=self.model)
 
         # Append to history
         self.history.append({"role": "user", "content": user_message})
         self.history.append({"role": "assistant", "content": json.dumps(parsed, ensure_ascii=False)})
 
-        # Merge any extracted profile data
+        # Merge extracted profile data if present
         if parsed.get("profile_data"):
             self.profile = merge_profile(self.profile, parsed["profile_data"], user_message)
 
         # Check mandatory fields
         is_complete, missing = validate_mandatory_profile_fields(self.profile)
+        if is_complete:
+            self.onboarding_complete = True
 
-        # ── Case 1: still missing mandatory fields ──────────────────────────
-        if not is_complete:
+        intent = parsed.get("intent")
+
+        # ── Case 1: Intent strictly requires profile AND profile is incomplete ──
+        if intent in PROFILE_DEPENDENT_INTENTS and not self.onboarding_complete:
             prompt = get_onboarding_prompt(missing, self.language)
             return {
                 "parsed":          parsed,
@@ -677,26 +761,27 @@ class NLPSession:
                 "missing_fields":  missing
             }
 
-        # ── Attach complete user profile so Task 3 engine always has it ──
+        # ── Attach complete user profile so Task 3 engine always has access to it ──
         parsed["profile_data"] = self.profile
 
-        # ── Case 2: just completed onboarding this turn ────────────────────
-        if not self.onboarding_complete:
-            self.onboarding_complete = True
+        # ── Case 2: Just completed onboarding this turn ────────────────────────
+        if intent == "update_profile" and self.onboarding_complete:
             if self.language == "arabic":
                 confirm = (
                     "✅ ممتاز! استلمت بياناتك بنجاح.\n"
                     "دلوقتي تقدر:\n"
                     "  • تسجل وجباتك (مثلاً: 'كلت 200g فراخ مشوية')\n"
                     "  • تطلب خطة أكل ('ممكن خطة أكل ليوم؟')\n"
-                    "  • تسأل عن سعرات أي أكلة ('كم سعرة في الأفوكادو؟')"
+                    "  • تسأل عن سعرات أي أكلة ('كم سعرة في الأفوكادو؟')\n"
+                    "  • تسأل أسئلة تمارين وتغذية ('أكل إيه قبل التمرين؟')"
                 )
             else:
                 confirm = (
                     "✅ Profile complete! Here's what you can do now:\n"
                     "  • Log a meal (e.g. 'I had 200g grilled chicken')\n"
                     "  • Request a meal plan ('Give me a full day meal plan')\n"
-                    "  • Ask about food calories ('How many calories in avocado?')"
+                    "  • Ask about food calories ('How many calories in avocado?')\n"
+                    "  • Ask fitness nutrition advice ('What to eat before workout?')"
                 )
             return {
                 "parsed":          parsed,
@@ -706,7 +791,7 @@ class NLPSession:
                 "missing_fields":  []
             }
 
-        # ── Case 3: normal flow — profile already complete ─────────────────
+        # ── Case 3: Ready state (simplified query or complete profile) ─────────
         return {
             "parsed":          parsed,
             "status":          "ready",
@@ -717,12 +802,11 @@ class NLPSession:
 
 
 # ==========================================
-# 9. Quick Test — run with: python nlp_parser.py
+# 9. Quick Test Execution
 # ==========================================
 
 if __name__ == "__main__":
     import sys, io
-    # Force UTF-8 output so Arabic characters print correctly on Windows
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
     def safe_print(*args, **kwargs):
@@ -732,32 +816,38 @@ if __name__ == "__main__":
             safe_str = " ".join(str(a).encode("ascii", "replace").decode() for a in args)
             print(safe_str)
 
-    safe_print("=" * 60)
-    safe_print("NLP Parser — Task 1 Quick Test")
-    safe_print("=" * 60)
+    safe_print("=" * 65)
+    safe_print("NLP Parser — Task 1 Upgraded Demonstration")
+    safe_print("=" * 65)
 
     session = NLPSession()
 
-    test_turns = [
-        # Turn 1: partial profile (missing height, activity, goal)
-        "أنا ولد اتولدت 2004-05-10، وزني 90، مش باكل بيض",
-        # Turn 2: fill in the rest
-        "طولي 175، بتمرن 4 أيام في الأسبوع وعايز أخس",
-        # Turn 3: log a meal (should now be in "ready" state)
-        "كلت 200g فراخ مشوية مع طبق رز",
+    test_queries = [
+        # 1. Simplified usage (Should NEVER be blocked by onboarding!)
+        "How many calories are in 200g chicken breast?",
+        # 2. Meal recommendation with target calories & meal type (Gap 1)
+        "Make me a 400-calorie breakfast without eggs",
+        # 3. Fitness nutrition question (FAISS RAG trigger - Gap 2)
+        "أكل إيه قبل التمرين عشان يديني طاقة؟",
+        # 4. Food substitution (Gap 2)
+        "What can I substitute for cheese in my diet?",
+        # 5. Onboarding profile
+        "أنا ولد اتولدت 2004-05-10، وزني 90 وطولي 175، بتمرن 4 أيام وعايز أخس"
     ]
 
-    for i, msg in enumerate(test_turns, 1):
-        safe_print(f"\n--- Turn {i} ---")
-        safe_print(f"User: {msg}")
-        result = session.process(msg)
-        safe_print(f"Status : {result['status']}")
-        safe_print(f"Intent : {result['parsed']['intent']}")
-        safe_print(f"Lang   : {result['parsed']['language_detected']}")
-        if result["prompt_for_user"]:
-            safe_print(f"Bot    : {result['prompt_for_user']}")
-        if result["missing_fields"]:
-            safe_print(f"Missing: {result['missing_fields']}")
-        if result["parsed"]["foods"]:
-            safe_print(f"Foods  : {json.dumps(result['parsed']['foods'], ensure_ascii=False, indent=2)}")
-        safe_print(f"Profile: {json.dumps(result['profile'], ensure_ascii=False, indent=2)}")
+    for i, q in enumerate(test_queries, 1):
+        safe_print(f"\n--- Query {i} ---")
+        safe_print(f"User: {q}")
+        res = session.process(q)
+        safe_print(f"Status : {res['status']}")
+        safe_print(f"Intent : {res['parsed']['intent']}")
+        if res['parsed'].get('meal_type'):
+            safe_print(f"MealType: {res['parsed']['meal_type']}")
+        if res['parsed'].get('target_calories'):
+            safe_print(f"TargetCal: {res['parsed']['target_calories']}")
+        if res['parsed'].get('requested_substitution'):
+            safe_print(f"SubFood : {res['parsed']['requested_substitution']}")
+        if res['parsed']['foods']:
+            safe_print(f"Foods  : {json.dumps(res['parsed']['foods'], ensure_ascii=False, indent=2)}")
+        if res['prompt_for_user']:
+            safe_print(f"Bot    : {res['prompt_for_user']}")
